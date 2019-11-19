@@ -16,7 +16,7 @@ Replication集群是常用MySQL集群的另一种方案，数据同步时单向�
 > docker network create --subnet 172.19.0.0/16 pxc_net      
 
 5.创建docker数据卷，一旦生成docker容器，不要在容器内保存业务的数据，要把数据放到宿主机上，可以把宿主机的一个目录映射到容器内，如果容器出现问题，只需要把容器删除，重现建立一个新的容器把目录映射给新的容器。      
-** 注意 **    
+**注意**    
 由于同时创建多个数据卷，和连续运行pxc多个镜像会导致容器运行闪退，所以这边采用每次创建一个数据卷，就映射到容器内，然后运行镜像，pxc容器运行间隔2分钟以上后才能创建下一个。      
 > docker volume create --name v1    
 
@@ -24,7 +24,7 @@ Replication集群是常用MySQL集群的另一种方案，数据同步时单向�
 
 6.运行第一个pxc镜像     
 ```     
-docker run -d -p 3355:3306 --name=node1 -v v1:/var/lib/mysql -e MYSQL_ROOT_PASSWORD=123456 -e CLUSTER_NAME=cluster1 -e XTRABACKUP_PASSWORD=123456 --privileged -net=pxc_net --ip 172.19.0.2 pxc 
+docker run -d -p 3355:3306 --name=node1 -v v1:/var/lib/mysql -e MYSQL_ROOT_PASSWORD=123456 -e CLUSTER_NAME=cluster1 -e XTRABACKUP_PASSWORD=123456 --privileged --net=pxc_net --ip 172.19.0.2 pxc 
 ```     
 命令说明：     
 -d: 代表创建的容器在后台运行     
@@ -54,7 +54,59 @@ mysql -uroot -p123456
 2.进入node2节点数据库容器，查看是否有node1_test数据库     
 3.可以在node3节点数据库，创建node3_test数据库，然后分别到各节点数据库查看是否数据同步      
 4.``` docker stop node1 ```停止node1节点容器，然后再各节点测试创建数据库，检查是否会数据同步，通过验证关闭node1并不影响其他节点数据的同步。     
-** 5.因为停止了node1节点容器，再重启发现无法启动该容器了。**      
+**5.因为停止了node1节点容器，再重启发现无法启动该容器了。**      
+6.再停止node2节点容器，也是无法重新启动容器。      
 
 #### 节点意外宕机，数据恢复   
-后续完善    
+因为集群节点异常宕机会记录一个同步信息点，异常节点全挂了，节点间各自记录的信息和集群内部信息都不统一导致启动不成功。     
+**解决方式**       
+1.直接通过``` docker start node1 ```或者任何一个节点是启动不了的，原因是集群之前的同步机制造成的，启动任何一个节点，该节点都会去其他节点同步数据，其它节点仍处于宕机状态，所以该节点启动失败，这也是pxc集群的强一致性的表现，解决方式是：      
+删除所有节点 ``` docker rm node1 node2 node3 node4 ``` 和数据卷中的grastate.dat文件    
+```     
+rm -rf /var/lib/docker/volumes/v1/_data/grastate.dat
+rm -rf /var/lib/docker/volumes/v2/_data/grastate.dat
+```    
+之后重新执行集群创建的命令即可，因为数据都在数据卷中，集群重新启动后数据仍然都在。     
+**注意**    
+1.node3创建数据库test_node3，然后停止node3容器   
+2.node1创建数据库test_node1，然后停止node1容器     
+3.node2创建数据库test_node2，然后停止node2,node4容器       
+4.通过删除grastate.dat文件方式，重新创建集群，查看数据    
+进入所有节点容器数据库查看数据都只有 test_node1,test_node3，因为强一致性，在CLUSTER_JOIN=node1,指定节点数据同步节点node1宕机，所以后续的数据没有同步上，数据丢失了。      
+**mac进入和退出LinuxKit**   
+由于Mac版docker是创建了虚拟环境LinuxKit,所以首先进入docker的LinuxKit终端     
+```    
+cd ~/Library/Containers/com.docker.docker/Data/vms/0/
+screen tty  # 命令登录终端，遇到空白命令行，直接回车即可
+退出终端是 先按 Ctrl+A 然后按 Ctrl+K 
+```    
+#### 集群热备份和恢复       
+由于上面提到的方式，数据会丢失，所以采用xtrabackup方案备份。       
+1.依据上面注意点，继续操作，先进入node4容器,以root用户进入系统    
+```       
+docker exec -it --user root node4 /bin/bash
+# 先确定系统是否有 apt-get 或者 yum
+yum update  # 因为这边有yum，所以更新一下
+yum install percona-xtrabackup  # 一般percona-xtrabackup已经在更新列表中，没有就选择安装   
+# 备份数据
+innobackupex --user=root --password=123456 /data/back/full
+```       
+2.进行全量恢复      
+**注意：pxc集群数据库可以热备份，但是不能热还原。为了避免恢复过程中的数据同步，所以采用空白的MySQL还原数据，然后再建立pxc集群。**       
+先停止所有容器，然后删除容器node1,node2...，删除存储卷v1,v2...   
+然后先只创建node1容器          
+``` docker exec -it --user root node1 /bin/basn ```进入node1容器，安装 percona-xtrabackup      
+```    
+# 未提交事务回滚
+innobackupex --user=root --password=1234 --apply-back /data/backup/full/2019-11-19_06_05_57/
+# 执行冷还原
+innobackupex --user=root --password=1234 --copy-back /data/backup/full/2019-11-19_06_05_57/
+
+# 退出容器，重启node1节点 
+docker stop node1
+docker start node1
+```   
+3.进入node1节点容器数据库，查看数据，然后重新建立其他节点。
+
+
+
